@@ -12,6 +12,7 @@ const PriceHistory = require('./models/pricehistory.model');
 const schedule = require('node-schedule');
 const firebaseAuth = require('./middleware/firebaseAuth');
 const CustomCraft = require("./models/customcraft.model");
+const AuctionCache = require("./models/auctioncache.model");
 
 module.exports = User;
 module.exports = Items;
@@ -179,6 +180,16 @@ app.get('/api/auctions', async (req, res) => {
     if (!connected_realm_id) {
       return res.status(400).json({ status: 'error', error: 'Missing connected_realm_id' });
     }
+    // Try to serve from AuctionCache (last 24h)
+    const cache = await AuctionCache.findOne({
+      type: 'auction',
+      region: 'eu',
+      connectedRealmId: Number(connected_realm_id),
+      fetchedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+    }).sort({ fetchedAt: -1 });
+    if (cache) {
+      return res.json({ status: 'ok', auctions: cache.data, cached: true });
+    }
     // Dev override: use access_token from query if provided, else use backend token
     let token = access_token;
     if (!token) {
@@ -194,7 +205,7 @@ app.get('/api/auctions', async (req, res) => {
       auctionCache[connected_realm_id] &&
       now - auctionCache[connected_realm_id].timestamp < CACHE_DURATION
     ) {
-      return res.json({ status: 'ok', auctions: auctionCache[connected_realm_id].data });
+      return res.json({ status: 'ok', auctions: auctionCache[connected_realm_id].data, cached: true });
     }
 
     // Fetch from Blizzard
@@ -249,6 +260,15 @@ app.get('/api/commodities', async (req, res) => {
   try {
     const { access_token, region } = req.query;
     const regionCode = region || 'eu';
+    // Try to serve from AuctionCache (last 24h)
+    const cache = await AuctionCache.findOne({
+      type: 'commodity',
+      region: regionCode,
+      fetchedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+    }).sort({ fetchedAt: -1 });
+    if (cache) {
+      return res.json({ status: 'ok', auctions: cache.data, cached: true });
+    }
     // Dev override: use access_token from query if provided, else use backend token
     let token = access_token;
     if (!token) {
@@ -468,6 +488,60 @@ app.delete('/api/crafts/:id', firebaseAuth, async (req, res) => {
     res.json({ status: 'ok' });
   } catch (err) {
     res.status(500).json({ status: 'error', error: err.message });
+  }
+});
+
+// DEV CRON: Fetch and cache commodities and auctions once a day at 3am
+schedule.scheduleJob('0 3 * * *', async () => {
+  try {
+    const region = 'eu';
+    let accessToken;
+    try {
+      accessToken = await getBlizzardAccessToken();
+    } catch (err) {
+      console.error('[AuctionCache Cron] Could not get Blizzard access token. Skipping.');
+      return;
+    }
+    // Fetch and cache commodities
+    try {
+      const commoditiesUrl = `https://${region}.api.blizzard.com/data/wow/auctions/commodities`;
+      const commoditiesRes = await axios.get(commoditiesUrl, {
+        params: { namespace: `dynamic-${region}`, locale: 'en_US' },
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      await AuctionCache.create({
+        type: 'commodity',
+        region,
+        data: commoditiesRes.data.auctions || [],
+        fetchedAt: new Date(),
+      });
+      console.log(`[AuctionCache Cron] Cached ${commoditiesRes.data.auctions?.length || 0} commodities for ${region}`);
+    } catch (err) {
+      console.error('[AuctionCache Cron] Error caching commodities:', err.message);
+    }
+    // Fetch and cache auctions for a set of connectedRealmIds (dev: just a few for now)
+    const connectedRealmIds = [1305, 1379, 1406]; // Example: Ragnaros, Kazzak, Silvermoon
+    for (const realmId of connectedRealmIds) {
+      try {
+        const auctionsUrl = `https://${region}.api.blizzard.com/data/wow/connected-realm/${realmId}/auctions`;
+        const auctionsRes = await axios.get(auctionsUrl, {
+          params: { namespace: `dynamic-${region}`, locale: 'en_US' },
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        await AuctionCache.create({
+          type: 'auction',
+          region,
+          connectedRealmId: realmId,
+          data: auctionsRes.data.auctions || [],
+          fetchedAt: new Date(),
+        });
+        console.log(`[AuctionCache Cron] Cached ${auctionsRes.data.auctions?.length || 0} auctions for realm ${realmId}`);
+      } catch (err) {
+        console.error(`[AuctionCache Cron] Error caching auctions for realm ${realmId}:`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error('[AuctionCache Cron] General error:', err);
   }
 });
 
